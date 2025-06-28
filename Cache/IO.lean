@@ -5,6 +5,7 @@ Authors: Arthur Paulino, Jon Eugster
 -/
 
 import Cache.Lean
+import Lake.Build.Common
 
 variable {α : Type}
 
@@ -70,7 +71,7 @@ def CURLBIN :=
 
 /-- leantar version at https://github.com/digama0/leangz -/
 def LEANTARVERSION :=
-  "0.1.15"
+  "0.1.16-pre"
 
 def EXE := if System.Platform.isWindows then ".exe" else ""
 
@@ -111,6 +112,8 @@ structure CacheM.Context where
   srcSearchPath : SearchPath
   /-- build directory for proofwidgets -/
   proofWidgetsBuildDir : FilePath
+  /-- directory for the Lake artifact cache -/
+  lakeArtifactDir? : Option FilePath
 
 @[inherit_doc CacheM.Context]
 abbrev CacheM := ReaderT CacheM.Context IO
@@ -133,13 +136,31 @@ def _root_.Lean.SearchPath.relativize (sp : SearchPath) : IO SearchPath := do
   let pwd' := pwd.toString ++ System.FilePath.pathSeparator.toString
   return sp.map fun x => ⟨if x = pwd then "." else x.toString.stripPrefix pwd'⟩
 
+/--
+Detects the directory Lake uses to cache artifacts.
+This is very sensitive to changes in `Lake.Env.compute`.
+-/
+def getLakeArtifactDir? : IO (Option FilePath) := do
+  let elan? ← Lake.findElanInstall?
+  let toolchain := (← IO.getEnv "ELAN_TOOLCHAIN").getD Lean.toolchain
+  let .ok cache ← Lake.Env.compute.getCache? elan? toolchain |>.toBaseIO
+    | return none
+  let artifactDir := cache.artifactDir
+  if (← artifactDir.pathExists) then
+    return artifactDir
+  else
+    IO.eprintln <| s!"Warning: Lake's cache directory '{artifactDir}' seems not to exist, \
+      most likely `cache` will not work as expected!"
+    return none
+
 private def CacheM.getContext : IO CacheM.Context := do
   let sp ← (← getSrcSearchPath).relativize
   let mathlibSource ← CacheM.mathlibDepPath sp
   return {
     mathlibDepPath := mathlibSource,
     srcSearchPath := sp,
-    proofWidgetsBuildDir := LAKEPACKAGESDIR / "proofwidgets" / ".lake" / "build"}
+    proofWidgetsBuildDir := LAKEPACKAGESDIR / "proofwidgets" / ".lake" / "build"
+    lakeArtifactDir? := ← getLakeArtifactDir?}
 
 /-- Run a `CacheM` in `IO` by loading the context from `LEAN_SRC_PATH`. -/
 def CacheM.run (f : CacheM α) : IO α := do ReaderT.run f (← getContext)
@@ -286,11 +307,35 @@ def hashes (hashMap : ModuleHashMap) : Lean.RBTree UInt64 compare :=
 
 end ModuleHashMap
 
+structure BuildPaths where
+  trace : FilePath
+  artifactDir : FilePath := "."
+  localPaths : Array FilePath := #[]
+  cachePaths : Array FilePath := #[]
+
+/--
+Extracts the Lake module build output hashes from a trace file.
+This is sensitive to changes in `Lake.readTraceFile`.
+-/
+def readTraceOutputs (path : FilePath) : BaseIO (Option Lake.ModuleOutputHashes) := do
+  let .ok contents ← IO.FS.readFile path |>.toBaseIO
+    | return none
+  if Lake.Hash.ofString? contents.trim |>.isSome then
+    return none
+  let .ok (data : Lake.BuildMetadata) := Json.parse contents >>= fromJson?
+    | return none
+  let some outs := data.outputs?
+    | return none
+  let .ok hashes := fromJson? outs
+    | return none
+  return hashes
+
+
 /--
 Given a module name, concatenates the paths to its build files.
 Each build file also has a `Bool` indicating whether that file is required for caching to proceed.
 -/
-def mkBuildPaths (mod : Name) : CacheM <| List (FilePath × Bool) := do
+def mkBuildPaths (mod : Name) : CacheM (Option BuildPaths) := do
   /-
   TODO: if `srcDir` or other custom lake layout options are set in the `lean_lib`,
   `packageSrcDir / LIBDIR` might be the wrong path!
@@ -307,48 +352,71 @@ def mkBuildPaths (mod : Name) : CacheM <| List (FilePath × Bool) := do
   if !(← (packageDir / ".lake").isDir) then
     IO.eprintln <| s!"Warning: {packageDir / ".lake"} seems not to exist, most likely `cache` \
       will not work as expected!"
-
-  return [
-    -- Note that `packCache` below requires that the `.trace` file is first in this list.
-    (packageDir / LIBDIR / path.withExtension "trace", true),
-    (packageDir / LIBDIR / path.withExtension "olean", true),
-    (packageDir / LIBDIR / path.withExtension "olean.hash", true),
-    (packageDir / LIBDIR / path.withExtension "ilean", true),
-    (packageDir / LIBDIR / path.withExtension "ilean.hash", true),
-    (packageDir / IRDIR  / path.withExtension "c", true),
-    (packageDir / IRDIR  / path.withExtension "c.hash", true),
-    (packageDir / LIBDIR / path.withExtension "extra", false)]
-
-/-- Check that all required build files exist. -/
-def allExist (paths : List (FilePath × Bool)) : IO Bool := do
-  for (path, required) in paths do
-    if required then if !(← path.pathExists) then return false
-  pure true
+  let trace := packageDir / LIBDIR / path.withExtension "trace"
+  if let some artifactDir := (← read).lakeArtifactDir? then
+    if let some outs ← readTraceOutputs trace then
+      let cachePaths : Array FilePath := #[
+        s!"{outs.olean}.olean",
+        s!"{outs.ilean}.ilean",
+        s!"{outs.c}.c"
+      ]
+      unless ← allExists cachePaths artifactDir do
+        return none
+      return some {trace, artifactDir, cachePaths}
+    else
+      let some olean ← Lake.Hash.load? (packageDir / LIBDIR / path.withExtension "olean.hash")
+        | return none
+      let some ilean ← Lake.Hash.load? (packageDir / LIBDIR / path.withExtension "ilean.hash")
+        | return none
+      let some c ← Lake.Hash.load? (packageDir / IRDIR / path.withExtension "c.hash")
+        | return none
+      let cachePaths : Array FilePath := #[
+        s!"{olean}.olean",
+        s!"{ilean}.ilean",
+        s!"{c}.c"
+      ]
+      unless ← allExists cachePaths artifactDir do
+        return none
+      return some {trace, artifactDir, cachePaths}
+  let localPaths := #[
+    packageDir / LIBDIR / path.withExtension "olean",
+    packageDir / LIBDIR / path.withExtension "olean.hash",
+    packageDir / LIBDIR / path.withExtension "ilean",
+    packageDir / LIBDIR / path.withExtension "ilean.hash",
+    packageDir / IRDIR  / path.withExtension "c",
+    packageDir / IRDIR  / path.withExtension "c.hash"
+  ]
+  unless ← allExists localPaths do
+    return none
+  return some {trace, localPaths}
+where
+  allExists paths (root : FilePath := ".") := paths.allM (root / · |>.pathExists)
 
 /-- Compresses build files into the local cache and returns an array with the compressed files -/
 def packCache (hashMap : ModuleHashMap) (overwrite verbose unpackedOnly : Bool)
-    (comment : Option String := none) :
+    (commit? : Option String := none) :
     CacheM <| Array String := do
   IO.FS.createDirAll CACHEDIR
   IO.println "Compressing cache"
   let sp := (← read).srcSearchPath
   let mut acc := #[]
   let mut tasks := #[]
+  let initComment := if let some c := commit? then s!"git=mathlib4@{c};" else ""
   for (mod, hash) in hashMap.toList do
     let sourceFile ← Lean.findLean sp mod
     let zip := hash.asLTar
     let zipPath := CACHEDIR / zip
-    let buildPaths ← mkBuildPaths mod
-    if ← allExist buildPaths then
+    if let some buildPaths ← mkBuildPaths mod then
       if overwrite || !(← zipPath.pathExists) then
         acc := acc.push (sourceFile, zip)
         tasks := tasks.push <| ← IO.asTask do
-          -- Note here we require that the `.trace` file is first
-          -- in the list generated by `mkBuildPaths`.
-          let trace :: args := (← buildPaths.filterM (·.1.pathExists)) |>.map (·.1.toString)
-            | unreachable!
-          runCmd (← getLeanTar) <| #[zipPath.toString, trace] ++
-            (if let some c := comment then #["-c", s!"git=mathlib4@{c}"] else #[]) ++ args
+          let usesLakeCache := !buildPaths.cachePaths.isEmpty
+          let comment := s!"{initComment}lakeCache={usesLakeCache}"
+          let opts := #["-C", "."] ++ if usesLakeCache then #["-C", buildPaths.artifactDir.toString] else #[]
+          let mut args := opts ++ #[zipPath.toString, buildPaths.trace.toString, "-c", comment]
+          args := buildPaths.localPaths.foldl (· ++ #["-i", "0", toString ·]) args
+          args := buildPaths.cachePaths.foldl (· ++ #["-i", "1", toString ·]) args
+          runCmd (← getLeanTar) args
       else if !unpackedOnly then
         acc := acc.push (sourceFile, zip)
   for task in tasks do
@@ -394,13 +462,13 @@ def unpackCache (hashMap : ModuleHashMap) (force : Bool) : CacheM Unit := do
     -/
     let isMathlibRoot ← isMathlibRoot
     let mathlibDepPath := (← read).mathlibDepPath.toString
+    let artifactDir? := (← read).lakeArtifactDir?
     let config : Array Lean.Json := hashMap.fold (init := #[]) fun config mod hash =>
       let pathStr := s!"{CACHEDIR / hash.asLTar}"
-      if isMathlibRoot || !isFromMathlib mod then
-        config.push <| .str pathStr
-      else
-        -- only mathlib files, when not in the mathlib4 repo, need to be redirected
-        config.push <| .mkObj [("file", pathStr), ("base", mathlibDepPath)]
+      -- only mathlib files, when not in the mathlib4 repo, need to be redirected
+      let localDir := if isMathlibRoot || !isFromMathlib mod then "." else mathlibDepPath
+      let baseDirs := if let some dir := artifactDir? then #[localDir, dir.toString] else #[localDir]
+      config.push <| .mkObj [("file", pathStr), ("base", toJson baseDirs)]
     stdin.putStr <| Lean.Json.compress <| .arr config
     let exitCode ← child.wait
     if exitCode != 0 then throw <| IO.userError s!"leantar failed with error code {exitCode}"
@@ -485,7 +553,7 @@ def leanModulesFromSpec (sp : SearchPath) (argₛ : String) :
           (i.e. `Mathlib.Data` when only the folder `Mathlib/Data/` but no \
           file `Mathlib/Data.lean` exists) is not supported yet!"
       else
-        return .error "Invalid argument: non-existing module {mod}"
+        return .error s!"Invalid argument: non-existing module {mod}"
 
 /--
 Parse command line arguments.
