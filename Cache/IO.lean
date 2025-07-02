@@ -138,13 +138,14 @@ def _root_.Lean.SearchPath.relativize (sp : SearchPath) : IO SearchPath := do
 
 /--
 Detects the directory Lake uses to cache artifacts.
-This is very sensitive to changes in `Lake.Env.compute`.
+This is very sensitive to changes in `Lake.Env.computeCache`.
 -/
 def getLakeArtifactDir? : IO (Option FilePath) := do
   let elan? ← Lake.findElanInstall?
-  let toolchain := (← IO.getEnv "ELAN_TOOLCHAIN").getD Lean.toolchain
-  let .ok cache ← Lake.Env.compute.getCache? elan? toolchain |>.toBaseIO
-    | return none
+  let toolchain ← Lake.Env.computeToolchain
+  let cache ← Lake.Env.computeCache elan? toolchain
+  if cache.isDisabled then
+    return none
   let artifactDir := cache.artifactDir
   if (← artifactDir.pathExists) then
     return artifactDir
@@ -320,9 +321,7 @@ This is sensitive to changes in `Lake.readTraceFile`.
 def readTraceOutputs (path : FilePath) : BaseIO (Option Lake.ModuleOutputHashes) := do
   let .ok contents ← IO.FS.readFile path |>.toBaseIO
     | return none
-  if Lake.Hash.ofString? contents.trim |>.isSome then
-    return none
-  let .ok (data : Lake.BuildMetadata) := Json.parse contents >>= fromJson?
+  let .ok data := Lake.BuildMetadata.parse contents
     | return none
   let some outs := data.outputs?
     | return none
